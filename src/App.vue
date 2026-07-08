@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { fetchFile } from '@ffmpeg/util';
+import classWorkerURL from './ffmpeg-worker.ts?worker&url';
 
 type OutputFile = {
   name: string;
@@ -9,7 +10,11 @@ type OutputFile = {
   size: string;
 };
 
-const CDN_BASE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
+const CORE_BASE_URLS = [
+  'https://registry.npmmirror.com/@ffmpeg/core/0.12.10/files/dist/umd',
+  'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd',
+  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd',
+];
 
 const selectedFile = ref<File | null>(null);
 const selectedFileUrl = ref<string | null>(null);
@@ -23,6 +28,8 @@ const isProcessing = ref(false);
 const ffmpegReady = ref(false);
 
 let ffmpeg: FFmpeg | null = null;
+let coreScriptBlobUrl: string | null = null;
+let coreWasmBlobUrl: string | null = null;
 
 const canStart = computed(() => selectedFile.value !== null && !isProcessing.value);
 const progressLabel = computed(() => `${Math.max(0, Math.min(100, progress.value))}%`);
@@ -48,6 +55,64 @@ function revokeUrl(url: string | null): void {
   if (url) {
     URL.revokeObjectURL(url);
   }
+}
+
+function updateLoadProgress(base: number, ratio: number): void {
+  const clampedRatio = Math.max(0, Math.min(1, ratio));
+  progress.value = Math.round(base + clampedRatio * 45);
+}
+
+async function fetchAsBlobUrl(
+  url: string,
+  mimeType: string,
+  baseProgress: number,
+  label: string,
+): Promise<string> {
+  statusText.value = label;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`资源请求失败：${response.status} ${response.statusText}`);
+  }
+
+  if (!response.body) {
+    const blob = await response.blob();
+    updateLoadProgress(baseProgress, 1);
+    return URL.createObjectURL(new Blob([blob], { type: mimeType }));
+  }
+
+  const total = Number(response.headers.get('content-length') ?? '0');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    if (value) {
+      chunks.push(value);
+      received += value.byteLength;
+
+      if (total > 0) {
+        updateLoadProgress(baseProgress, received / total);
+      }
+    }
+  }
+
+  const merged = new Uint8Array(received);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  updateLoadProgress(baseProgress, 1);
+  return URL.createObjectURL(new Blob([merged], { type: mimeType }));
 }
 
 function clearOutputs(): void {
@@ -84,11 +149,65 @@ async function ensureFfmpeg(): Promise<FFmpeg> {
       progress.value = Math.round(currentProgress * 100);
     });
 
-    await instance.load({
-      coreURL: await toBlobURL(`${CDN_BASE}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${CDN_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
-      workerURL: await toBlobURL(`${CDN_BASE}/ffmpeg-core.worker.js`, 'text/javascript'),
-    });
+    let lastError: unknown = null;
+
+    for (const baseUrl of CORE_BASE_URLS) {
+      try {
+        progress.value = 5;
+        hintText.value = `正在尝试加载引擎源：${baseUrl}`;
+
+        revokeUrl(coreScriptBlobUrl);
+        revokeUrl(coreWasmBlobUrl);
+
+        coreScriptBlobUrl = await fetchAsBlobUrl(
+          `${baseUrl}/ffmpeg-core.js`,
+          'text/javascript',
+          5,
+          '正在下载 ffmpeg 核心脚本。',
+        );
+        coreWasmBlobUrl = await fetchAsBlobUrl(
+          `${baseUrl}/ffmpeg-core.wasm`,
+          'application/wasm',
+          50,
+          '正在下载 ffmpeg wasm 核心，首次通常较慢。',
+        );
+
+        statusText.value = '正在初始化本地处理引擎。';
+        progress.value = 96;
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => {
+          controller.abort();
+        }, 20000);
+
+        try {
+          await instance.load(
+            {
+              classWorkerURL,
+              coreURL: coreScriptBlobUrl,
+              wasmURL: coreWasmBlobUrl,
+              workerURL: coreScriptBlobUrl,
+            },
+            { signal: controller.signal },
+          );
+        } finally {
+          window.clearTimeout(timeoutId);
+        }
+
+        progress.value = 100;
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        revokeUrl(coreScriptBlobUrl);
+        revokeUrl(coreWasmBlobUrl);
+        coreScriptBlobUrl = null;
+        coreWasmBlobUrl = null;
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
 
     ffmpeg = instance;
     ffmpegReady.value = true;
@@ -116,6 +235,21 @@ async function exportBlob(
   };
 }
 
+async function runFfmpegCommand(
+  worker: FFmpeg,
+  args: string[],
+  logs: string[],
+): Promise<void> {
+  const exitCode = await worker.exec(args);
+
+  if (exitCode === 0) {
+    return;
+  }
+
+  const detail = logs.slice(-8).join(' | ');
+  throw new Error(detail ? `FFmpeg 失败：${detail}` : `FFmpeg 失败，退出码 ${exitCode}`);
+}
+
 async function processVideo(): Promise<void> {
   if (!selectedFile.value) {
     return;
@@ -134,58 +268,74 @@ async function processVideo(): Promise<void> {
 
   try {
     const worker = await ensureFfmpeg();
+    const commandLogs: string[] = [];
+    const logListener = ({ message }: { message: string }) => {
+      commandLogs.push(message);
+    };
 
-    statusText.value = '正在写入本地文件到处理引擎。';
-    await worker.writeFile(inputName, await fetchFile(sourceFile));
+    worker.on('log', logListener);
 
     try {
+      statusText.value = '正在写入本地文件到处理引擎。';
+      await worker.writeFile(inputName, await fetchFile(sourceFile));
+
+      try {
+        commandLogs.length = 0;
+        progress.value = 0;
+        statusText.value = '正在提取 MP3 音频。';
+        await runFfmpegCommand(
+          worker,
+          [
+            '-i',
+            inputName,
+            '-map',
+            '0:a:0',
+            '-vn',
+            '-c:a',
+            'libmp3lame',
+            '-q:a',
+            '2',
+            audioName,
+          ],
+          commandLogs,
+        );
+        audioOutput.value = await exportBlob(worker, audioName, 'audio/mpeg');
+      } catch {
+        audioOutput.value = null;
+      }
+
+      commandLogs.length = 0;
       progress.value = 0;
-      statusText.value = '正在提取 MP3 音频。';
-      await worker.exec([
-        '-i',
-        inputName,
-        '-vn',
-        '-c:a',
-        'libmp3lame',
-        '-q:a',
-        '2',
-        audioName,
-      ]);
-      audioOutput.value = await exportBlob(worker, audioName, 'audio/mpeg');
-    } catch {
-      audioOutput.value = null;
+      statusText.value = '正在导出去音轨 MP4。';
+      await runFfmpegCommand(
+        worker,
+        [
+          '-i',
+          inputName,
+          '-an',
+          '-c:v',
+          'copy',
+          '-movflags',
+          '+faststart',
+          silentName,
+        ],
+        commandLogs,
+      );
+      silentVideoOutput.value = await exportBlob(worker, silentName, 'video/mp4');
+
+      statusText.value = audioOutput.value
+        ? '处理完成，可以分别下载 MP3 和静音 MP4。'
+        : '视频处理完成，但未导出 MP3，原视频可能没有可提取的音轨。';
+      hintText.value = ffmpegReady.value
+        ? '处理引擎已经驻留在当前页面，继续处理其他视频会更快。'
+        : hintText.value;
+    } finally {
+      worker.off('log', logListener);
     }
-
-    progress.value = 0;
-    statusText.value = '正在导出去音轨 MP4。';
-    await worker.exec([
-      '-i',
-      inputName,
-      '-an',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'ultrafast',
-      '-crf',
-      '23',
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      silentName,
-    ]);
-    silentVideoOutput.value = await exportBlob(worker, silentName, 'video/mp4');
-
-    statusText.value = audioOutput.value
-      ? '处理完成，可以分别下载 MP3 和静音 MP4。'
-      : '视频处理完成，但未导出 MP3，原视频可能没有可提取的音轨。';
-    hintText.value = ffmpegReady.value
-      ? '处理引擎已经驻留在当前页面，继续处理其他视频会更快。'
-      : hintText.value;
   } catch (error) {
     const message = error instanceof Error ? error.message : '未知错误';
     statusText.value = `处理失败：${message}`;
-    hintText.value = '请尝试更换文件，或使用体积更小、编码更常见的视频。';
+    hintText.value = '如果再次失败，请把页面上的完整错误文本发我。';
   } finally {
     isProcessing.value = false;
 
@@ -203,6 +353,8 @@ async function processVideo(): Promise<void> {
 
 onBeforeUnmount(() => {
   revokeUrl(selectedFileUrl.value);
+  revokeUrl(coreScriptBlobUrl);
+  revokeUrl(coreWasmBlobUrl);
   clearOutputs();
 });
 </script>
