@@ -86,12 +86,8 @@ async function load({
     throw new Error('coreURL is required');
   }
 
-  try {
-    workerScope.importScripts(coreURL);
-  } catch {
-    const imported = await import(/* @vite-ignore */ coreURL);
-    workerScope.createFFmpegCore = imported.default as CreateFFmpegCore | undefined;
-  }
+  const imported = await import(/* @vite-ignore */ coreURL);
+  workerScope.createFFmpegCore = imported.default as CreateFFmpegCore | undefined;
 
   if (!workerScope.createFFmpegCore) {
     throw ERROR_IMPORT_FAILURE;

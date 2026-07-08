@@ -11,9 +11,9 @@ type OutputFile = {
 };
 
 const CORE_BASE_URLS = [
-  'https://registry.npmmirror.com/@ffmpeg/core/0.12.10/files/dist/umd',
-  'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd',
-  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd',
+  'https://registry.npmmirror.com/@ffmpeg/core/0.12.10/files/dist/esm',
+  'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm',
+  'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm',
 ];
 
 const selectedFile = ref<File | null>(null);
@@ -333,7 +333,12 @@ async function processVideo(): Promise<void> {
       worker.off('log', logListener);
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : '未知错误';
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === 'string'
+          ? error
+          : JSON.stringify(error, null, 2) || '未知错误';
     statusText.value = `处理失败：${message}`;
     hintText.value = '如果再次失败，请把页面上的完整错误文本发我。';
   } finally {
